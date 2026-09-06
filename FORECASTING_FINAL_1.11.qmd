@@ -1,0 +1,438 @@
+---
+title: "Forecasting for Planning Capacity in Long-Term Care Units of the Portuguese National Health Service (SNS)"
+author: 
+  - "Afonso Silva (N20251159)"
+  - "Luis Monteiro (N20250078)"
+  - "Rohan Kale (N20250957)"
+  - "Susana Reis (N20250038)"
+date: "`r Sys.Date()`"
+format:
+  pdf:
+    code-overflow: wrap
+    code-line-numbers: false
+    bibliography: bibliography.bib
+    csl: apa.csl
+    reference-location: section
+    reference-title: "Bibliographic References"
+    papersize: a4
+    #margin-top: 25mm
+    #margin-bottom: 25mm
+    #margin-left: 25mm
+    #margin-right: 25mm
+editor: visual
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  comment = "",
+  fig.width = 10,
+  fig.height = 6
+)
+
+suppressPackageStartupMessages({
+  library(fpp3)
+  library(urca)
+  library(ggtime)
+  library(moments)
+  library(gt)
+  library(purrr)
+})
+```
+
+## Introduction
+
+Integrated continuous health care is a critical service for citizens requiring long-term care in the portuguese SNS. This type of assistance demands high quality standards due to its complexity [@costaRedeNacionalCuidados2024].
+
+By using time series forecast, and choosing accurate models we can accurately predict the number of referrals required annually, and optimize resources to provide best possible service [@entidadereguladoradasaudeersAcessoQualidadeConcorrencia2015].
+
+## Data set
+
+This data set comprises the number of patients referred by healthcare units in Portugal to the continuous care network, it combines both hospitals and primary care centers to the National Integrated Continuous Care Network (RNCCI) in Portugal. The data is updated monthly and covers all Portuguese regions and is available [here](https://transparencia.sns.gov.pt/explore/?sort=modified).
+
+```{r data_import, echo=FALSE, message=FALSE, warning=FALSE}
+patients_raw <- readr::read_delim(
+  paste0(
+    "https://transparencia.sns.gov.pt/api/explore/v2.1/catalog/datasets/",
+    "utentes-referenciados-pelos-hospitais-e-cs-para-a-rede/exports/csv?",
+    "lang=en&timezone=Europe%2FLondon&use_labels=true&delimiter=%3B"
+  ),
+  delim = ";",
+  show_col_types = FALSE
+)
+
+# Aggregate to monthly time series
+patients_tsibble <- patients_raw %>%
+  mutate(ym = yearmonth(`Período`)) %>%
+  group_by(ym) %>%
+  summarise(Referred_Patients = sum(`Número de Utentes`, na.rm = TRUE), .groups = "drop") %>%
+  as_tsibble(index = ym)
+
+n_test <- 12
+patients_train <- patients_tsibble %>% 
+  slice(1:(n()-n_test))
+
+patients_test <- patients_tsibble %>% 
+  slice((n()-n_test+1):n())
+
+head(patients_tsibble, 10)
+
+```
+
+Here's the correspondent plot of total monthly patients over time:
+
+```{r Original_Series_Plot, echo=FALSE, message=FALSE, warning=FALSE}
+# visual ispection:
+autoplot(patients_tsibble, Referred_Patients) +
+  labs(title = "Fig.1: Original Series: Visual Inspection") +
+  theme_minimal(base_size = 14)
+```
+
+There is clear evidence of a structural break in the time series around the onset of the COVID-19 pandemic. Additionally, the series exhibits a trend, seasonality and fluctuation in variance over time. A 5% significance level was considered to this analysis.
+
+## Training and testing sets
+
+The data set was partitioned into two distinct subsets: a training set and a test set, this is pivotal in time series analysis, to allow the construction and calibration of predictive models using the training data (in-sample forecasting) while reserving the more recent observations for model evaluation (out of sample forecasting).
+
+```{r}
+n_test <- 12
+n_total <- nrow(patients_tsibble)
+split_point <- n_total - n_test
+
+# Split train and test data
+train_patients <- patients_tsibble %>% slice(1:split_point)      # Training data
+test_patients  <- patients_tsibble %>% slice((split_point+1):n_total)  # Test data
+
+# Label train/test sets
+train_patients_labeled <- train_patients %>%
+  mutate(Set = "Train")
+test_patients_labeled <- test_patients %>%
+  mutate(Set = "Test")
+patients_plot <- bind_rows(train_patients_labeled, test_patients_labeled)
+
+# Plot train/test split
+ggplot(patients_plot, aes(x = ym, y = Referred_Patients, color = Set, group = Set)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Train" = "steelblue", "Test" = "orange")) +
+  labs(
+    title = "Fig.2: Patients Referred: Train/Test Split",
+    x = "Period", y = "Total Patients", color = "Set"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+
+```
+
+## Seasonality
+
+There are clear evidences of seasonality in time series with recurring patterns and periodic fluctuations. Numbers rise early during the year, but April shows a dip with moderate recovery during Summer (May to August).
+
+```{r seasonality, echo=FALSE, message=FALSE, warning=FALSE}
+patients_train %>%
+  gg_season(Referred_Patients, labels = "both") +
+  labs(y = "Fig.3: Total of Referenced Patients", 
+       x = "Month",
+       title = "Fig.3:Seasonality Pattern")+
+  theme_minimal(base_size = 14)
+```
+
+## STL Trends and Dickey-Fuller
+
+Using Seasonal and Trend decomposition by Loess (STL), we observed an upraising trend, which means over the years more people are consuming long continuous care.
+
+```{r load, echo=FALSE, message=FALSE, warning=FALSE}
+train_patients |>
+  model(STL(Referred_Patients ~ season(window = "periodic"))) |>
+  components() |>
+  autoplot() +
+  labs(title = "Fig.4: STL trends") +
+  theme_minimal(base_size = 14)
+```
+
+## Heteroscedasticity
+
+The series exhibited clear signs of Heteroscedasticity, as evidenced fluctuations in variance across time. A logarithm transformation was applied. According to Hyndman and [@hyndmanForecastingPrinciplesPractice2018], the log transformation was applied. However,[@endersAppliedEconometricTime2015] notes that when heteroscedasticity is minor, such transformations provide limited modeling benefit and may not meaningfully improve model performance.
+
+```{r differencing_seasonal_visual, echo=FALSE, message=FALSE, warning=FALSE}
+#| echo: false
+#| message: false
+#| warning: false
+
+# First seasonal difference (lag = 12) and then regular difference (lag = 1)
+patients_train %>%
+  autoplot(difference(Referred_Patients, 12)) +
+  labs(title = "Fig.5: Seasonally Differenced Series") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(size = 14))
+```
+
+```{r ADF_seasonal}
+# Run the ADF test on that seasonally‐differenced series
+summary(ur.df(na.omit(difference(patients_train$Referred_Patients, 12)),
+type='drift', lags=10))
+
+```
+
+The seasonally differenced training series, exhibits fluctuations around zero. This transformation removes the recurring seasonal component associated with a 12-month period, thereby attenuating annual patterns present in the original series, assuming there is no trend, but values might fluctuate around a non zero mean, the ADF will be applied with "drift".
+
+Applying Augmented Dickey-Fuller (ADF) unit root test with 5% significance:
+
+-   **H0 (null):** The series has a unit root (non-stationary)
+-   **H1 (alternative):** The series is stationary (no unit root)\
+
+We started the test at lag 14, and iterate until last lag was statistically significant. After iteratively testing, lag 10 was found significant at the 1% level. The estimated tau2 statistic for the null hypothesis of a unit root was −3.08, which is less than the 5% critical value of −2.89. Additionally, phi1 (4,74) exceeds its 5% critical value of 4.71. Together, these results indicate rejection of the null hypothesis at the 5% significance level, confirming that the series is now stationary.
+
+## Descriptive analysis
+
+Before proceeding, we analysed our series:
+
+```{r basic_stats}
+seasonal_diff <- na.omit(difference(patients_tsibble$Referred_Patients, 12))
+
+data.frame(x = as.numeric(seasonal_diff)) %>%
+  summarise(
+    n = n(),
+    mean = mean(x),
+    sd = sd(x),
+    min = min(x),
+    Q1 = quantile(x, 0.25),
+    median = median(x),
+    Q3 = quantile(x, 0.75),
+    max = max(x),
+    skewness = skewness(x),
+    kurtosis = kurtosis(x)
+  ) %>%
+  gt() %>%
+  tab_header(title = "Descriptive Statistics - Seasonally Differenced") %>%
+  fmt_number(columns = everything(), decimals = 2)
+
+
+```
+
+The seasonally differenced time series (n = 105) is summarized as follows: The mean rounded is 138 patients and the standard deviation 504.79, indicating substantial variability following seasonal adjustment. The distribution ranged from -1404 to 1533, with first and third quartiles at -132 and 527, respectively. The median attendance after seasonal difference was 95 patients.
+
+```{r histogram_final}
+
+library(ggplot2)
+library(dplyr)
+
+desc_stats <- data.frame(x = seasonal_diff) %>%
+  summarise(
+    mean = mean(x, na.rm = TRUE), 
+    sd = sd(x, na.rm = TRUE)
+  )
+
+mean_val <- desc_stats$mean
+sd_val <- desc_stats$sd
+
+ggplot(data.frame(x = seasonal_diff), aes(x = x)) +
+  geom_histogram(aes(y = stat(density)), bins = 20, fill = "steelblue", color = "white", alpha = 0.7) +
+  geom_density(color = "red", linetype = "dashed", size = 1.2) +
+  stat_function(fun = dnorm, args = list(mean = mean_val, sd = sd_val), color = "darkgreen", size = 1) +
+  annotate("text", x = mean_val + sd_val, y = 0.0015, label = "Normal Curve", color = "darkgreen", angle = 0, hjust = 0) +
+  annotate("text", x = mean_val - sd_val, y = 0.0015, label = "Empirical Density", color = "red", angle = 0, hjust = 0) +
+  theme_minimal() +
+  labs(
+    title = "Fig.6:Histogram, Empirical Density, and Normal Distribution",
+    x = "Seasonally Differenced Series", 
+    y = "Density"
+  )
+
+```
+
+The empirical density plot is slightly skewed compared to the normal curve, with some deviations in the tails as kurtosis 3.86 \> 3 (Leptokurtic behavior).
+
+## ACF and PACF
+
+Let's now observe the Autocorrelation (ACF) and Partial autocorrelation (PACF) functions and determine the best models.
+
+```{r ACF_final}
+acf(seasonal_diff,
+    lag.max = 48,
+    main = "Fig.7:ACF of Seasonally Differenced Series")
+
+```
+
+ACF decays after lag 1 following a substantial spike, this suggests a presence of a significant moving average (MA)=q component at order 1. The seasonal pattern repeats every 12 months, we see a pattern of ACF peaks at lag 12, lag 24, and lag 48, so we consider an SMA(3)=Q, or SMA(2).
+
+```{r PACF_final}
+pacf(seasonal_diff,
+    lag.max = 48,
+    main = "Fig.8:PACF of Seasonally Differenced Series")
+
+```
+
+PACF displays significant spikes at lags 1 (with a subsequent hard cut off), suggesting that the process may be adequately described as an AR model of order 1. In seasonal component, we have one spike on 2nd lag, one at lag 12, and one at 22, this could be SAR(2), but can also be noise.
+
+Only SARIMA models with total AR and MA order not exceeding four are estimated, as recommended in [@endersAppliedEconometricTime2015], ensuring robust parameter inference given the sample limitations (n=93).
+
+## Model candidates
+
+Now an overview of candidates that best model our study:
+
+```{r model_estimation}
+fit <- patients_train %>% 
+  model(
+    model_1 = ARIMA(Referred_Patients ~ pdq(1,0,1) + PDQ(0,1,0)),
+    model_2 = ARIMA(Referred_Patients ~ pdq(1,0,1) + PDQ(1,1,0)),
+    model_3 = ARIMA(Referred_Patients ~ pdq(1,0,2) + PDQ(0,1,0)),
+    model_4 = ARIMA(Referred_Patients ~ pdq(2,0,2) + PDQ(1,1,0)),
+    auto = ARIMA(Referred_Patients)
+  )
+
+fit %>%
+  glance() %>% 
+  select(-c(ar_roots, ma_roots))
+
+```
+
+```{r residuals_visual}
+fit %>%
+  select(model_1) %>%
+  gg_tsresiduals() +
+  labs(title = "Fig.9: Residual Analysis") +
+  theme(plot.title = element_text(size = 14))
+```
+
+Among the estimated SARIMA models without a constant, SARIMA(1,0,1)(1,1,1) yields the lowest AIC, AICc, and BIC values, indicating the best balance between fit and model complexity for this seasonally differenced series.
+
+```{r residuals_ljung_box}
+res1 <- augment(fit) %>% 
+  filter(.model == 'model_1') %>% 
+  features(.innov, ljung_box, lag = 10, dof = 2)
+
+res2 <- augment(fit) %>% 
+  filter(.model == 'model_2') %>% 
+  features(.innov, ljung_box, lag = 10, dof = 3)
+
+res3 <- augment(fit) %>% 
+  filter(.model == 'model_3') %>% 
+  features(.innov, ljung_box, lag = 10, dof = 4)
+
+res4 <- augment(fit) %>% 
+  filter(.model == 'model_4') %>% 
+  features(.innov, ljung_box, lag = 10, dof = 5)
+
+bind_rows(res1, res2, res3, res4)
+```
+
+According to [@hyndmanForecastingPrinciplesPractice2018], a practical rule for the lag order in the Ljung–Box test is the square root of the number of observations in the series (i.e., lag = ⌈n⌉⌈ n ⌉), which balances sensitivity and sample size.
+
+Residual diagnostics for SARIMA(1,0,1)(0,1,1)\_0 and SARIMA(1,0,1)(1,1,0)\_0 indicate good model adequacy, with Ljung–Box test statistics of 12.23 (p = 0.09) and 10.89 (p = 0.14), respectively. As both p-values exceed the conventional 0.05 threshold, there is no significant evidence of remaining serial correlation in the residuals. Thus, both models may be considered well-specified and suitable for forecasting and inference.
+
+## Residuals
+
+To objectively select the most appropriate model for the data, information criteria (AIC, BIC) as well as residual diagnostics (autocorrelation functions, normality) and out-of-sample forecast accuracy will be systematically compared, when applicable.
+
+We evaluate the residuals for each SARIMA:
+
+```{r accuracy_assessment}
+fit %>%
+  forecast(h = 12) %>% 
+  accuracy(patients_tsibble)
+
+```
+
+The forecast accuracy results confirm that SARIMA(1,0,1)(0,1,1)\_0 outperforms the alternative SARIMA model across all standard measures (MAE, RMSE, MAPE).
+
+```{r forecast_plot}
+fit %>%
+  forecast(h = 12) %>% 
+  filter(.model == 'model_1') %>% 
+  autoplot(patients_tsibble) +
+  labs(title = 'Fig.10:SARIMA Forecast for Patient Referrals',
+       x = 'Period',
+       y = 'Number of Referred Patients')
+
+```
+
+Bellow we compare the forecast estimation with the actual results and evaluate the error:
+
+```{r recomendations}
+# === RECOMENDAÇÕES ===
+# === STEP 1: Prepare test set  ===
+actual_test <- test_patients %>%
+  as_tibble() %>%
+  mutate(ym = as.character(ym))
+
+# === STEP 2: Model on training data ===
+fit_patients <- train_patients %>%
+  model(ARIMA(Referred_Patients))
+
+# === STEP 3: Forecast for test period ===
+forecast_test <- fit_patients %>%
+  forecast(h = n_test) %>%
+  hilo(level = 95) %>%
+  as_tibble() %>%
+  mutate(
+    ym = as.character(ym),
+    Forecast = .mean,
+    PI95_lower = map_dbl(`95%`, ~ .x$lower),
+    PI95_upper = map_dbl(`95%`, ~ .x$upper)
+  ) %>%
+  select(ym, Forecast, PI95_lower, PI95_upper)
+
+# === STEP 4: Join and Comparison ===
+comparative_table <- forecast_test %>%
+  left_join(
+    actual_test %>%
+      select(ym, Referred_Patients) %>%
+      rename(Actual = Referred_Patients),
+    by = "ym"
+  ) %>%
+  rename(Period = ym) %>%
+  mutate(
+    Absolute_Error = Forecast - Actual,
+    Percent_Error = 100 * (Forecast - Actual) / Actual
+  ) %>%
+  select(Period, Actual, Forecast, PI95_lower, PI95_upper, Absolute_Error, Percent_Error)
+
+# === RECOMMENDATIONS ===
+recommendations <- comparative_table %>%
+  mutate(
+    Recommendation = case_when(
+      Absolute_Error > 0 ~ sprintf(
+        "Forecasted %.0f but actual was %.0f (overestimated by %.0f); model tends to predict high. Buffer: %.0f-%.0f.",
+        Forecast, Actual, Absolute_Error, PI95_lower, PI95_upper
+      ),
+      Absolute_Error < 0 ~ sprintf(
+        "Forecasted %.0f but actual was %.0f (underestimated by %.0f); model tends to predict low. Buffer: %.0f-%.0f.",
+        Forecast, Actual, abs(Absolute_Error), PI95_lower, PI95_upper
+      ),
+      TRUE ~ sprintf(
+        "Forecast matched actual at %.0f patients; buffer range %.0f-%.0f.",
+        Forecast, PI95_lower, PI95_upper
+      )
+    )
+  ) %>%
+  select(Period, Recommendation)
+
+# === Display Results ===
+comparative_table %>%
+  gt() %>%
+  tab_header(title = "Validation Results: Forecast vs. Actual (Test Set)") %>%
+  fmt_number(
+    columns = c(Actual, Forecast, PI95_lower, PI95_upper, Absolute_Error, Percent_Error), 
+    decimals = 2
+  )
+
+```
+
+## Recommendations for Hospital Bed Planning (2025–2026)
+
+Based on SARIMA time series modeling using historical patient arrival data, we project monthly beds needed over the next year as follows:
+
+Most months show a forecasted increase in patient arrivals compared to the previous year, with average growth of approximately 3–7%. Highest increases are expected in March (10.9%), November (8.7%), and December (8.4%), with potential for demand to surge up to the upper bounds of the 95% prediction interval.
+
+## Conclusion
+
+The time series of patient referrals to long-term care units in Portugal shows clear seasonality, a trend, and a structural break around the COVID-19 pandemic.
+
+After making the data stationary with seasonal differencing, the Model_2 SARIMA(1,0,1)(0,1,1) model was found to be the best for forecasting, based on its accuracy and statistical criteria. The model’s residuals passed all diagnostic checks, confirming it is suitable for making forecasts. Model selection balances in-sample fit (AIC/BIC) with out-of-sample performance. The robust outperformance of SARIMA(1,0,1)(0,1,1) on all error measures justifies its adoption for decision support, even if fitting statistics are marginally less favorable.
+
+There are some limitations with our analysis. First, the sample size is small, which creates an unstable variance and imperfect stationarity, second problem is monthly fluctuations. And perhaps the biggest error in our estimates is caused by the shock induced by COVID19 pandemic, this disrupts the detection of any long term patterns. Any future analysis must increase the time period of sampling to account for random shocks or to discard the pandemic period.
+
+## Bibliographic References
